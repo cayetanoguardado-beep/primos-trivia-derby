@@ -1,0 +1,14 @@
+PRIMOS TRIVIA DERBY - FAST SETUP CHECKLIST
+
+[ ] 1. Unzip this folder.
+[ ] 2. Create a free Supabase project.
+[ ] 3. Run supabase/schema.sql in Supabase SQL Editor.
+[ ] 4. Copy Supabase Project URL.
+[ ] 5. Copy Supabase service_role key.
+[ ] 6. Upload ALL project files/folders to your GitHub repo.
+[ ] 7. Import the GitHub repo into Vercel.
+[ ] 8. Add SUPABASE_URL in Vercel Environment Variables.
+[ ] 9. Add SUPABASE_SERVICE_ROLE_KEY in Vercel Environment Variables.
+[ ] 10. Deploy.
+[ ] 11. Open /host on the TV/laptop.
+[ ] 12. Send the normal site link to the managers.
