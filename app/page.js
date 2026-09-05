@@ -29,6 +29,19 @@ export default function PlayerPage(){
   }
   useEffect(()=>{if(!player)return;fetchState();const id=setInterval(fetchState,POLL);return()=>clearInterval(id);},[player,roomCode]);
   useEffect(()=>{if(state?.room?.current_question!==answeredQuestion){setAnswerResult(null);setError('');}},[state?.room?.current_question,answeredQuestion]);
+  useEffect(()=>{
+    if(!player||!state?.players||state?.room?.status!=='lobby')return;
+    const stillInRoom=state.players.some(p=>p.id===player.id);
+    if(!stillInRoom){
+      localStorage.removeItem(`primos_player_${roomCode}`);
+      setPlayer(null);
+      setState(null);
+      setName('');
+      setAnswerResult(null);
+      setAnsweredQuestion(null);
+      setError('');
+    }
+  },[state,player,roomCode]);
 
   async function join(e){
     e.preventDefault();setError('');
