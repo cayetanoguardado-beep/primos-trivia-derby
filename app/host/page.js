@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const POLL=500;
 export default function HostPage(){
@@ -8,6 +8,7 @@ export default function HostPage(){
   const [state,setState]=useState(null);
   const [error,setError]=useState('');
   const [busy,setBusy]=useState(false);
+  const awayAnnounced=useRef(false);
 
   useEffect(()=>{const saved=localStorage.getItem('primos_host');if(saved){try{const x=JSON.parse(saved);setRoomCode(x.roomCode||'PRIMOS26');setHostKey(x.hostKey||'');}catch{}}},[]);
 
@@ -16,6 +17,24 @@ export default function HostPage(){
     try{const r=await fetch(`/api/room/state?room=${encodeURIComponent(roomCode)}`,{cache:'no-store'});const d=await r.json();if(d.ok)setState(d);}catch{}
   }
   useEffect(()=>{if(!hostKey)return;fetchState();const id=setInterval(fetchState,POLL);return()=>clearInterval(id);},[hostKey,roomCode]);
+
+  useEffect(()=>{
+    if(state?.room?.status==='lobby'){
+      awayAnnounced.current=false;
+      return;
+    }
+    if(state?.room?.status==='running'&&!awayAnnounced.current&&(state?.players||[]).some(p=>(p.yards||0)>0)){
+      awayAnnounced.current=true;
+      if(typeof window!=='undefined'&&'speechSynthesis' in window){
+        window.speechSynthesis.cancel();
+        const call=new SpeechSynthesisUtterance('And away they go!');
+        call.rate=1.05;
+        call.pitch=1.0;
+        call.volume=1;
+        window.speechSynthesis.speak(call);
+      }
+    }
+  },[state?.room?.status,state?.players]);
 
   async function createRoom(){
     setBusy(true);setError('');
