@@ -50,14 +50,24 @@ security definer
 set search_path = public
 as $$
 declare
-  prior_correct integer := 0;
-  bonus integer := 0;
   awarded integer := 0;
   old_yards integer := 0;
   new_yards integer := 0;
   place integer := null;
+  active_question integer := -1;
+  room_status text;
+  unfinished integer := 0;
+  race_finished boolean := false;
 begin
-  perform 1 from rooms where code=p_room_code for update;
+  select current_question, status
+    into active_question, room_status
+  from rooms
+  where code = p_room_code
+  for update;
+
+  if room_status is null then raise exception 'room not found'; end if;
+  if room_status <> 'running' then raise exception 'race is not currently running'; end if;
+  if active_question <> p_question_index then raise exception 'question is no longer active'; end if;
 
   if exists (
     select 1 from answers
@@ -71,22 +81,14 @@ begin
   where id=p_player_id and room_code=p_room_code
   for update;
 
-  if old_yards is null then
-    raise exception 'player not found';
-  end if;
+  if old_yards is null then raise exception 'player not found'; end if;
 
-  if p_correct then
-    select count(*) into prior_correct
-    from answers
-    where room_code=p_room_code and question_index=p_question_index and correct=true;
-    bonus := greatest(0, 3 - prior_correct);
-    awarded := 10 + bonus;
-  end if;
+  awarded := case when p_correct then 10 else -3 end;
 
   insert into answers(room_code,player_id,question_index,answer_index,correct,awarded_yards)
   values(p_room_code,p_player_id,p_question_index,p_answer_index,p_correct,awarded);
 
-  new_yards := least(100, old_yards + awarded);
+  new_yards := greatest(0, least(100, old_yards + awarded));
   update players set yards=new_yards where id=p_player_id;
 
   if new_yards >= 100 then
@@ -96,13 +98,36 @@ begin
       from players where room_code=p_room_code;
       update players set finish_place=place where id=p_player_id;
     end if;
+  else
+    select finish_place into place from players where id=p_player_id;
+  end if;
+
+  if p_correct then
+    select count(*) into unfinished
+    from players
+    where room_code=p_room_code and finish_place is null;
+
+    if unfinished = 0 then
+      race_finished := true;
+      update rooms
+      set status='finished', question_started_at=null, updated_at=now()
+      where code=p_room_code;
+    else
+      update rooms
+      set current_question=current_question+1,
+          question_started_at=now(),
+          updated_at=now()
+      where code=p_room_code;
+    end if;
   end if;
 
   return jsonb_build_object(
     'awardedYards',awarded,
-    'speedBonus',bonus,
+    'speedBonus',0,
     'yards',new_yards,
-    'finishPlace',place
+    'finishPlace',place,
+    'advanced',p_correct,
+    'finished',race_finished
   );
 end;
 $$;
