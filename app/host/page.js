@@ -33,7 +33,7 @@ export default function HostPage(){
 
   const start=()=>hostAction('/api/room/start');
   const nextQuestion=()=>hostAction('/api/room/next');
-  const reset=async()=>{if(confirm('Reset all yards, answers, and draft positions for the remaining managers?'))await hostAction('/api/room/reset');};
+  const clearAll=async()=>{if(confirm('Clear the entire room? This removes ALL managers, answers, yards, and draft positions.'))await hostAction('/api/room/reset');};
   const removeManager=async(p)=>{if(confirm(`Remove ${p.name} from the next race?`))await hostAction('/api/room/remove',{playerId:p.id});};
 
   const invite=typeof window!=='undefined'?`${location.origin}/?room=${roomCode}`:'';
@@ -56,7 +56,7 @@ export default function HostPage(){
         <div className="muted center">Managers open:</div><div className="inviteLink">{invite}</div>
         <div className="hostButtons"><button className="btn" onClick={()=>navigator.clipboard?.writeText(invite)}>Copy Invite Link</button><button className="btn" onClick={()=>document.documentElement.requestFullscreen?.()}>⛶ Full Screen</button></div>
         <div className="playersCompact">{(state?.players||[]).map(p=><div className="playerCompact" key={p.id}><div><strong>{p.name}</strong><div className="muted">{p.finish_place?`Draft Pick #${p.finish_place}`:`${p.yards} yd`}</div></div>{state?.room?.status==='finished'&&<button className="removeBtn" onClick={()=>removeManager(p)} disabled={busy}>Remove</button>}</div>)}</div>
-        <div className="hostButtons"><button className="btn primary" disabled={busy||state?.room?.status!=='lobby'||(state?.players?.length||0)<1} onClick={start}>Start Race</button><button className="btn" disabled={busy||state?.room?.status!=='running'} onClick={nextQuestion}>Skip Question</button><button className="btn danger" disabled={busy} onClick={reset}>Reset Race</button></div>
+        <div className="hostButtons"><button className="btn primary" disabled={busy||state?.room?.status!=='lobby'||(state?.players?.length||0)<1} onClick={start}>Start Race</button><button className="btn" disabled={busy||state?.room?.status!=='running'} onClick={nextQuestion}>Skip Question</button><button className="btn danger" disabled={busy} onClick={clearAll}>Clear All</button></div>
         {error&&<div className="error">{error}</div>}
       </aside>
 
@@ -66,7 +66,7 @@ export default function HostPage(){
         <div className="card questionCard">
           {state?.room?.status==='lobby'&&<><div className="status">LOBBY</div><div className="question">{state.players.length}/10 managers joined</div><p className="muted">Start whenever the participating managers are ready.</p></>}
           {state?.room?.status==='running'&&state.question&&<><div className="row"><span className="pill">{state.question.category}</span><span className="muted">Question {state.question.index+1}</span><span className="raceMode">⚡ First correct answer advances</span></div><div className="question">{state.question.question}</div><div className="answers hostAnswers">{state.question.options.map((o,i)=><div key={i} className="btn answer" style={{cursor:'default'}}>{String.fromCharCode(65+i)}. {o}</div>)}</div><p className="muted">Wrong answer: −3 yards. Correct answer: +10 yards and the next question appears immediately for everyone.</p></>}
-          {state?.room?.status==='finished'&&<><div className="status">RACE COMPLETE</div><div className="question">Final draft order locked in</div><p className="muted">Use the Remove buttons on the left if you want to drop managers before resetting for another race.</p></>}
+          {state?.room?.status==='finished'&&<><div className="status">RACE COMPLETE</div><div className="question">Final draft order locked in</div><p className="muted">Use Remove for individual managers, or Clear All to empty the room completely.</p></>}
         </div>
       </section>
     </div>
