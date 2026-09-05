@@ -1,63 +1,70 @@
 'use client';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
-const POLL=900;
-export default function HostPage(){
-  const [roomCode,setRoomCode]=useState('PRIMOS26');
-  const [hostKey,setHostKey]=useState('');
+const POLL=1000;
+export default function PlayerPage(){
+  const [roomCode,setRoomCode]=useState('');
+  const [name,setName]=useState('');
+  const [player,setPlayer]=useState(null);
   const [state,setState]=useState(null);
   const [error,setError]=useState('');
-  const [busy,setBusy]=useState(false);
+  const [answerResult,setAnswerResult]=useState(null);
+  const [answeredQuestion,setAnsweredQuestion]=useState(null);
   const [seconds,setSeconds]=useState(20);
-  const lastAuto=useRef(-1);
 
-  useEffect(()=>{const saved=localStorage.getItem('primos_host');if(saved){try{const x=JSON.parse(saved);setRoomCode(x.roomCode||'PRIMOS26');setHostKey(x.hostKey||'');}catch{}}},[]);
+  useEffect(()=>{
+    const p=new URLSearchParams(location.search);
+    const code=(p.get('room')||'').toUpperCase();
+    if(code){
+      setRoomCode(code);
+      try{
+        const saved=JSON.parse(localStorage.getItem(`primos_player_${code}`)||'null');
+        if(saved?.id&&saved?.token){setPlayer(saved);setName(saved.name||'Manager');}
+      }catch{}
+    }
+  },[]);
 
   async function fetchState(){
     if(!roomCode)return;
     try{const r=await fetch(`/api/room/state?room=${encodeURIComponent(roomCode)}`,{cache:'no-store'});const d=await r.json();if(d.ok)setState(d);}catch{}
   }
-  useEffect(()=>{if(!hostKey)return;fetchState();const id=setInterval(fetchState,POLL);return()=>clearInterval(id);},[hostKey,roomCode]);
+  useEffect(()=>{if(!player)return;fetchState();const id=setInterval(fetchState,POLL);return()=>clearInterval(id);},[player,roomCode]);
+  useEffect(()=>{if(state?.room?.current_question!==answeredQuestion){setAnswerResult(null);}},[state?.room?.current_question,answeredQuestion]);
+
 
   useEffect(()=>{
     if(state?.room?.status!=='running'||!state.room.question_started_at){setSeconds(20);return;}
-    const tick=()=>{const elapsed=Math.floor((Date.now()-new Date(state.room.question_started_at).getTime())/1000);setSeconds(Math.max(0,20-elapsed));};tick();const id=setInterval(tick,250);return()=>clearInterval(id);
+    const tick=()=>{const elapsed=Math.floor((Date.now()-new Date(state.room.question_started_at).getTime())/1000);setSeconds(Math.max(0,20-elapsed));};
+    tick();const id=setInterval(tick,250);return()=>clearInterval(id);
   },[state?.room?.question_started_at,state?.room?.status]);
 
-  useEffect(()=>{
-    const q=state?.room?.current_question;
-    if(state?.room?.status==='running'&&seconds===0&&Number.isInteger(q)&&lastAuto.current!==q){lastAuto.current=q;nextQuestion();}
-  },[seconds,state?.room?.status,state?.room?.current_question]);
-
-  async function createRoom(){
-    setBusy(true);setError('');
-    const r=await fetch('/api/room/create',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode})});const d=await r.json();setBusy(false);
-    if(!d.ok){setError(d.error||'Could not create room.');return;}setRoomCode(d.roomCode);setHostKey(d.hostKey);localStorage.setItem('primos_host',JSON.stringify(d));await fetchState();
-  }
-  async function hostAction(path){
-    setBusy(true);setError('');const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,hostKey})});const d=await r.json();setBusy(false);if(!d.ok){setError(d.error||'Action failed.');return d;}await fetchState();return d;
-  }
-  const start=()=>hostAction('/api/room/start');
-  const nextQuestion=()=>hostAction('/api/room/next');
-  const reset=async()=>{if(confirm('Reset all yards, answers, and draft positions?'))await hostAction('/api/room/reset');};
-
-  const invite=typeof window!=='undefined'?`${location.origin}/?room=${roomCode}`:'';
-  const sorted=useMemo(()=>[...(state?.players||[])].sort((a,b)=>(a.finish_place||99)-(b.finish_place||99)||b.yards-a.yards),[state]);
-
-  if(!hostKey){
-    return <main className="page"><div className="hero card"><div className="top"><h1>📺 Primos Trivia Derby Host</h1><p>Create the room you’ll show on the TV.</p></div><div className="stack"><label><span className="label">Room code</span><input className="input" value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,''))} maxLength={10}/></label>{error&&<div className="error">{error}</div>}<button className="btn primary" disabled={busy} onClick={createRoom}>{busy?'Creating…':'Create Room'}</button><a className="btn center" href="/" style={{textDecoration:'none'}}>Player Screen</a></div></div></main>;
+  async function join(e){
+    e.preventDefault();setError('');
+    const r=await fetch('/api/room/join',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,name})});
+    const d=await r.json();if(!d.ok){setError(d.error||'Could not join.');return;}setPlayer(d.player);setName(d.player.name);localStorage.setItem(`primos_player_${roomCode}`,JSON.stringify(d.player));await fetchState();
   }
 
-  return <main className="page"><div className="shell"><div className="top"><h1>🏇 2026 Primos Trivia Derby</h1><p>Room <strong>{roomCode}</strong></p></div>
+  async function answer(index){
+    if(!state?.question || answerResult)return;
+    const q=state.question.index;setAnsweredQuestion(q);
+    const r=await fetch('/api/answer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,playerId:player.id,playerToken:player.token,questionIndex:q,answerIndex:index})});
+    const d=await r.json();if(!d.ok){setError(d.error||'Could not submit answer.');return;}setAnswerResult({...d,chosen:index});await fetchState();
+  }
+
+  const me=useMemo(()=>state?.players?.find(p=>p.id===player?.id),[state,player]);
+
+  if(!player){
+    return <main className="page"><div className="hero card"><div className="top"><h1>🏇 Primos Trivia Derby</h1><p>Join the room, answer trivia, move your horse.</p></div><form className="stack" onSubmit={join}><label><span className="label">Room code</span><input className="input" value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase())} maxLength={10} placeholder="PRIMOS26" /></label><label><span className="label">Manager name</span><input className="input" value={name} onChange={e=>setName(e.target.value)} maxLength={24} placeholder="Your name" /></label>{error&&<div className="error">{error}</div>}<button className="btn primary" type="submit">Join Race</button><a className="btn center" href="/host" style={{textDecoration:'none'}}>Host / TV Screen</a></form></div></main>;
+  }
+
+  return <main className="page"><div className="shell"><div className="top"><h1>🏇 {name}</h1><p>Room <strong>{roomCode}</strong></p></div>
     <div className="grid cols">
-      <aside className="card stack"><div className="status">ROOM CODE</div><div className="bigcode">{roomCode}</div><div className="muted center">Managers open:</div><div className="center" style={{wordBreak:'break-all'}}>{invite}</div><button className="btn" onClick={()=>navigator.clipboard?.writeText(invite)}>Copy Invite Link</button><button className="btn" onClick={()=>document.documentElement.requestFullscreen?.()}>⛶ Full Screen</button><div className="players">{(state?.players||[]).map(p=><div className="player" key={p.id}>{p.finish_place&&<span className="pick">#{p.finish_place}</span>}<strong>{p.name}</strong><div className="muted">{p.yards} yd</div></div>)}</div><div className="row"><button className="btn primary" disabled={busy||state?.room?.status!=='lobby'||state?.players?.length!==10} onClick={start}>Start Race</button><button className="btn" disabled={busy||state?.room?.status!=='running'} onClick={nextQuestion}>Next</button><button className="btn danger" disabled={busy} onClick={reset}>Reset</button></div>{error&&<div className="error">{error}</div>}</aside>
-      <section className="stack">
-        <div className="card"><div className="track">{(state?.players||[]).map(p=><div key={p.id} className={`lane${p.finish_place?' finish':''}`}><div className="horse" style={{left:`${Math.min(90,2+p.yards*.88)}%`}}><span className="horseIcon">🐎</span><span className="horseName">{p.name}{p.finish_place?` • Pick #${p.finish_place}`:''}</span></div></div>)}</div></div>
-        <div className="card">
-          {state?.room?.status==='lobby'&&<><div className="status">LOBBY</div><div className="question">{state.players.length}/10 managers joined</div><p className="muted">Share the link or room code, then start when everybody is ready.</p></>}
-          {state?.room?.status==='running'&&state.question&&<><div className="row"><span className="pill">{state.question.category}</span><span className="muted">Question {state.question.index+1} of {state.room.total_questions}</span><span style={{marginLeft:'auto'}} className="timer">{seconds}</span></div><div className="question">{state.question.question}</div><div className="answers">{state.question.options.map((o,i)=><div key={i} className="btn answer" style={{cursor:'default'}}>{String.fromCharCode(65+i)}. {o}</div>)}</div><p className="muted">The host auto-advances at 0 seconds, or you can press Next manually.</p></>}
-          {state?.room?.status==='finished'&&<><div className="status">FINAL DRAFT ORDER</div><div className="question">Race complete</div><div className="players">{sorted.filter(p=>p.finish_place).map(p=><div className="player" key={p.id}><span className="pick">#{p.finish_place}</span><strong>{p.name}</strong></div>)}</div></>}
-        </div>
+      <section className="card"><div className="status">YOUR HORSE</div><div className="question">{me?.finish_place ? `Finished — Draft Pick #${me.finish_place}` : `${me?.yards||0} yards`}</div><div className="lane"><div className="horse" style={{left:`${Math.min(90,2+(me?.yards||0)*.88)}%`}}><span className="horseIcon">🐎</span></div></div><div className="spacer"/><div className="muted">Correct answer: +10 yards. Fastest correct answers can earn +3, +2, or +1 bonus yards.</div></section>
+      <section className="card">
+        {state?.room?.status==='lobby' && <><div className="status">WAITING FOR HOST</div><div className="question">You’re in the race.</div><p className="muted">Keep this page open. The first question will appear automatically.</p></>}
+        {state?.room?.status==='running' && state.question && <><div className="row"><span className="pill">{state.question.category}</span><span className="muted">Question {state.question.index+1}</span><span style={{marginLeft:'auto'}} className="timer">{seconds}</span></div><div className="question">{state.question.question}</div><div className="answers">{state.question.options.map((opt,i)=>{const cls=answerResult?.chosen===i ? (answerResult.correct?' correct':' wrong'):'';return <button key={i} className={`btn answer${cls}`} disabled={!!answerResult || !!me?.finish_place} onClick={()=>answer(i)}>{String.fromCharCode(65+i)}. {opt}</button>})}</div>{answerResult&&<div className="status" style={{marginTop:12}}>{answerResult.correct ? `CORRECT! +${answerResult.awardedYards} yards${answerResult.speedBonus?` (${answerResult.speedBonus} speed bonus)`:''}` : 'WRONG — no yards this question'}</div>}</>}
+        {state?.room?.status==='finished' && <><div className="status">RACE COMPLETE</div><div className="question">Draft Pick #{me?.finish_place||'—'}</div><p className="muted">The host has the final 1–10 draft order.</p></>}
+        {error&&<div className="error" style={{marginTop:10}}>{error}</div>}
       </section>
     </div>
   </div></main>;

@@ -1,32 +1,17 @@
-import { getAdminSupabase } from '@/lib/supabase';
-import { cleanRoomCode, jsonError } from '@/lib/api';
-import { publicQuestion, QUESTIONS } from '@/lib/questions';
+import { requireHost } from '@/lib/host-auth';
+import { jsonError } from '@/lib/api';
 
-export async function GET(request) {
+export async function POST(request) {
   try {
-    const code = cleanRoomCode(new URL(request.url).searchParams.get('room'));
-    if (!code) return jsonError('Room code required.');
-    const supabase = getAdminSupabase();
-    const { data:room } = await supabase.from('rooms')
-      .select('code,status,current_question,question_started_at,created_at')
-      .eq('code',code).maybeSingle();
-    if (!room) return jsonError('Room not found.',404);
-
-    const { data:players, error } = await supabase.from('players')
-      .select('id,name,yards,finish_place,joined_at')
-      .eq('room_code',code)
-      .order('joined_at',{ascending:true});
+    const { roomCode, hostKey } = await request.json();
+    const auth = await requireHost(roomCode, hostKey);
+    if (!auth.ok) return jsonError(auth.error, auth.status);
+    const { count } = await auth.supabase.from('players').select('*',{count:'exact',head:true}).eq('room_code',auth.code);
+    if ((count || 0) !== 10) return jsonError('All 10 managers must join before the race starts.',409);
+    const { error } = await auth.supabase.from('rooms').update({
+      status:'running', current_question:0, question_started_at:new Date().toISOString()
+    }).eq('code',auth.code);
     if (error) throw error;
-
-    const question = room.current_question >= 0 ? publicQuestion(room.current_question) : null;
-    return Response.json({
-      ok:true,
-      room:{...room, total_questions:QUESTIONS.length},
-      players:players || [],
-      question
-    });
-  } catch (e) {
-    console.error(e);
-    return jsonError('Could not load room.',500);
-  }
+    return Response.json({ok:true});
+  } catch(e){ console.error(e); return jsonError('Could not start race.',500); }
 }
