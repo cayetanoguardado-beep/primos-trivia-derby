@@ -31,6 +31,19 @@ export default function HostPage(){
     await fetchState();return d;
   }
 
+  async function changeRoom(){
+    const raw=prompt('Enter the new room code:','PRIMOS26');
+    if(raw===null)return;
+    const newRoomCode=raw.toUpperCase().replace(/[^A-Z0-9]/g,'');
+    if(newRoomCode.length<4){setError('Room code must be at least 4 letters or numbers.');return;}
+    setBusy(true);setError('');
+    const r=await fetch('/api/room/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,hostKey,newRoomCode})});
+    const d=await r.json();setBusy(false);
+    if(!d.ok){setError(d.error||'Could not change room code.');return;}
+    setRoomCode(d.roomCode);setState(null);
+    localStorage.setItem('primos_host',JSON.stringify({roomCode:d.roomCode,hostKey}));
+  }
+
   const start=()=>hostAction('/api/room/start');
   const nextQuestion=()=>hostAction('/api/room/next');
   const clearAll=async()=>{if(confirm('Clear the entire room? This removes ALL managers, answers, yards, and draft positions.'))await hostAction('/api/room/reset');};
@@ -54,10 +67,10 @@ export default function HostPage(){
       <aside className="card hostSidebar">
         <div className="status">ROOM CODE</div><div className="bigcode">{roomCode}</div>
         <div className="muted center">Managers open:</div><div className="inviteLink">{invite}</div>
-        <div className="hostButtons"><button className="btn" onClick={()=>navigator.clipboard?.writeText(invite)}>Copy Invite Link</button><button className="btn" onClick={()=>document.documentElement.requestFullscreen?.()}>⛶ Full Screen</button></div>
-        <div className="playersCompact">{(state?.players||[]).map(p=><div className="playerCompact" key={p.id}><div><strong>{p.name}</strong><div className="muted">{p.finish_place?`Draft Pick #${p.finish_place}`:`${p.yards} yd`}</div></div>{state?.room?.status==='finished'&&<button className="removeBtn" onClick={()=>removeManager(p)} disabled={busy}>Remove</button>}</div>)}</div>
+        <div className="hostButtons"><button className="btn" onClick={()=>navigator.clipboard?.writeText(invite)}>Copy Link</button><button className="btn" onClick={changeRoom} disabled={busy}>Change Room Code</button><button className="btn" onClick={()=>document.documentElement.requestFullscreen?.()}>⛶ Full Screen</button></div>
+        <div className="playersCompact">{(state?.players||[]).map(p=><div className="playerCompact" key={p.id}><div className="playerCompactText"><strong>{p.name}</strong><div className="muted">{p.finish_place?`Pick #${p.finish_place}`:`${p.yards} yd`}</div></div>{state?.room?.status==='finished'&&<button className="removeBtn" onClick={()=>removeManager(p)} disabled={busy}>Remove</button>}</div>)}</div>
         <div className="hostButtons"><button className="btn primary" disabled={busy||state?.room?.status!=='lobby'||(state?.players?.length||0)<1} onClick={start}>Start Race</button><button className="btn" disabled={busy||state?.room?.status!=='running'} onClick={nextQuestion}>Skip Question</button><button className="btn danger" disabled={busy} onClick={clearAll}>Clear All</button></div>
-        {error&&<div className="error">{error}</div>}
+        {error&&<div className="error hostError">{error}</div>}
       </aside>
 
       <section className="hostMain stack">
