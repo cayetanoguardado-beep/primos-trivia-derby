@@ -1,6 +1,6 @@
 import { getAdminSupabase } from '@/lib/supabase';
 import { cleanRoomCode, jsonError } from '@/lib/api';
-import { publicQuestion, QUESTIONS } from '@/lib/questions';
+import { publicQuestion, questionPool } from '@/lib/questions';
 
 export async function GET(request) {
   try {
@@ -8,7 +8,7 @@ export async function GET(request) {
     if (!code) return jsonError('Room code required.');
     const supabase = getAdminSupabase();
     const { data:room } = await supabase.from('rooms')
-      .select('code,status,current_question,question_started_at,created_at')
+      .select('code,status,current_question,question_started_at,created_at,difficulty')
       .eq('code',code).maybeSingle();
     if (!room) return jsonError('Room not found.',404);
 
@@ -18,12 +18,27 @@ export async function GET(request) {
       .order('joined_at',{ascending:true});
     if (error) throw error;
 
-    const question = room.current_question >= 0 ? publicQuestion(room.current_question) : null;
+    const { data:latestAnswer } = await supabase.from('answers')
+      .select('id,player_id,question_index,correct,awarded_yards,answered_at')
+      .eq('room_code',code)
+      .order('id',{ascending:false})
+      .limit(1)
+      .maybeSingle();
+
+    const difficulty=room.difficulty||'normal';
+    const question = room.current_question >= 0 ? publicQuestion(room.current_question,difficulty) : null;
+    const playerList=players || [];
+    const latest = latestAnswer ? {
+      ...latestAnswer,
+      playerName:playerList.find(p=>p.id===latestAnswer.player_id)?.name || 'Manager'
+    } : null;
+
     return Response.json({
       ok:true,
-      room:{...room, total_questions:QUESTIONS.length},
-      players:players || [],
-      question
+      room:{...room, difficulty, total_questions:questionPool(difficulty).length},
+      players:playerList,
+      question,
+      latestAnswer:latest
     });
   } catch (e) {
     console.error(e);
