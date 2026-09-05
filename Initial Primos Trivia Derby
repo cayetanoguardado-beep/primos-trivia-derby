@@ -1,0 +1,712 @@
+import { getAdminSupabase } from '@/lib/supabase';
+import { cleanRoomCode, jsonError } from '@/lib/api';
+import { QUESTIONS } from '@/lib/questions';
+
+export async function POST(request) {
+  try {
+    const { roomCode, playerId, playerToken, questionIndex, answerIndex } = await request.json();
+    const code = cleanRoomCode(roomCode);
+    const qIndex = Number(questionIndex);
+    const aIndex = Number(answerIndex);
+    if (!code || !playerId || !playerToken || !Number.isInteger(qIndex) || !Number.isInteger(aIndex)) return jsonError('Invalid answer submission.');
+    const question = QUESTIONS[qIndex];
+    if (!question || aIndex < 0 || aIndex >= question.options.length) return jsonError('Invalid question or answer.');
+
+    const supabase = getAdminSupabase();
+    const { data: playerAuth } = await supabase.from('players')
+      .select('id')
+      .eq('id', playerId)
+      .eq('room_code', code)
+      .eq('player_token', playerToken)
+      .maybeSingle();
+    if (!playerAuth) return jsonError('Invalid player session.',403);
+    const { data:room } = await supabase.from('rooms').select('status,current_question').eq('code',code).maybeSingle();
+    if (!room || room.status !== 'running') return jsonError('Race is not currently running.',409);
+    if (room.current_question !== qIndex) return jsonError('That question is no longer active.',409);
+
+    const correct = question.answer === aIndex;
+    const { data, error } = await supabase.rpc('apply_answer', {
+      p_room_code:code,
+      p_player_id:playerId,
+      p_question_index:qIndex,
+      p_answer_index:aIndex,
+      p_correct:correct
+    });
+    if (error) {
+      if (String(error.message).toLowerCase().includes('duplicate')) return jsonError('You already answered this question.',409);
+      throw error;
+    }
+    return Response.json({ok:true,correct,...(data || {})});
+  } catch(e){ console.error(e); return jsonError('Could not submit answer.',500); }
+}
+
+import crypto from 'node:crypto';
+import { getAdminSupabase } from '@/lib/supabase';
+import { cleanRoomCode, jsonError } from '@/lib/api';
+
+export async function POST(request) {
+  try {
+    const { roomCode } = await request.json();
+    const code = cleanRoomCode(roomCode || 'PRIMOS26');
+    if (code.length < 4) return jsonError('Room code must be at least 4 characters.');
+    const supabase = getAdminSupabase();
+    const hostKey = crypto.randomBytes(24).toString('hex');
+
+    const { data: existing } = await supabase.from('rooms').select('code').eq('code', code).maybeSingle();
+    if (existing) return jsonError('That room code already exists. Try another one.', 409);
+
+    const { error } = await supabase.from('rooms').insert({
+      code,
+      host_key: hostKey,
+      status:'lobby',
+      current_question:-1,
+      question_started_at:null
+    });
+    if (error) throw error;
+    return Response.json({ ok:true, roomCode:code, hostKey });
+  } catch (e) {
+    console.error(e);
+    return jsonError('Could not create room.', 500);
+  }
+}
+
+import crypto from 'node:crypto';
+import { getAdminSupabase } from '@/lib/supabase';
+import { cleanName, cleanRoomCode, jsonError } from '@/lib/api';
+
+export async function POST(request) {
+  try {
+    const { roomCode, name } = await request.json();
+    const code = cleanRoomCode(roomCode);
+    const playerName = cleanName(name);
+    if (!code || !playerName) return jsonError('Room code and manager name are required.');
+    const supabase = getAdminSupabase();
+
+    const { data: room } = await supabase.from('rooms').select('code,status').eq('code', code).maybeSingle();
+    if (!room) return jsonError('Room not found.', 404);
+    if (room.status !== 'lobby') return jsonError('This race has already started.', 409);
+
+    const { count } = await supabase.from('players').select('*', { count:'exact', head:true }).eq('room_code', code);
+    if ((count || 0) >= 10) return jsonError('This room already has 10 managers.', 409);
+
+    const playerToken = crypto.randomBytes(24).toString('hex');
+    const { data, error } = await supabase.from('players')
+      .insert({ room_code:code, name:playerName, player_token:playerToken })
+      .select('id,name')
+      .single();
+    if (error) {
+      if (String(error.code) === '23505') return jsonError('That manager name is already in the room.', 409);
+      throw error;
+    }
+    return Response.json({ ok:true, player:{...data, token:playerToken} });
+  } catch (e) {
+    console.error(e);
+    return jsonError('Could not join room.', 500);
+  }
+}
+
+import { requireHost } from '@/lib/host-auth';
+import { jsonError } from '@/lib/api';
+import { QUESTIONS } from '@/lib/questions';
+
+export async function POST(request) {
+  try {
+    const { roomCode, hostKey } = await request.json();
+    const auth = await requireHost(roomCode, hostKey);
+    if (!auth.ok) return jsonError(auth.error, auth.status);
+
+    const { data:players } = await auth.supabase.from('players').select('finish_place').eq('room_code',auth.code);
+    const allFinished = (players || []).length > 0 && (players || []).every(p=>p.finish_place);
+    const next = auth.room.current_question + 1;
+    if (allFinished || next >= QUESTIONS.length) {
+      if (!allFinished) {
+        const { data: standings } = await auth.supabase.from('players')
+          .select('id,yards,finish_place,joined_at')
+          .eq('room_code',auth.code);
+        const finished = (standings || []).filter(p=>p.finish_place);
+        let nextPlace = finished.reduce((m,p)=>Math.max(m,p.finish_place||0),0) + 1;
+        const remaining = (standings || [])
+          .filter(p=>!p.finish_place)
+          .map(p=>({...p,tie:Math.random()}))
+          .sort((a,b)=>b.yards-a.yards || a.tie-b.tie);
+        for (const p of remaining) {
+          await auth.supabase.from('players').update({finish_place:nextPlace++}).eq('id',p.id);
+        }
+      }
+      await auth.supabase.from('rooms').update({status:'finished',question_started_at:null}).eq('code',auth.code);
+      return Response.json({ok:true,finished:true});
+    }
+
+    const { error } = await auth.supabase.from('rooms').update({
+      current_question:next,
+      question_started_at:new Date().toISOString()
+    }).eq('code',auth.code);
+    if (error) throw error;
+    return Response.json({ok:true,finished:false});
+  } catch(e){ console.error(e); return jsonError('Could not advance question.',500); }
+}
+
+import { requireHost } from '@/lib/host-auth';
+import { jsonError } from '@/lib/api';
+
+export async function POST(request) {
+  try {
+    const { roomCode, hostKey } = await request.json();
+    const auth = await requireHost(roomCode,hostKey);
+    if (!auth.ok) return jsonError(auth.error,auth.status);
+    await auth.supabase.from('answers').delete().eq('room_code',auth.code);
+    await auth.supabase.from('players').update({yards:0,finish_place:null}).eq('room_code',auth.code);
+    await auth.supabase.from('rooms').update({status:'lobby',current_question:-1,question_started_at:null}).eq('code',auth.code);
+    return Response.json({ok:true});
+  } catch(e){ console.error(e); return jsonError('Could not reset race.',500); }
+}
+
+import { requireHost } from '@/lib/host-auth';
+import { jsonError } from '@/lib/api';
+
+export async function POST(request) {
+  try {
+    const { roomCode, hostKey } = await request.json();
+    const auth = await requireHost(roomCode, hostKey);
+    if (!auth.ok) return jsonError(auth.error, auth.status);
+    const { count } = await auth.supabase.from('players').select('*',{count:'exact',head:true}).eq('room_code',auth.code);
+    if ((count || 0) !== 10) return jsonError('All 10 managers must join before the race starts.',409);
+    const { error } = await auth.supabase.from('rooms').update({
+      status:'running', current_question:0, question_started_at:new Date().toISOString()
+    }).eq('code',auth.code);
+    if (error) throw error;
+    return Response.json({ok:true});
+  } catch(e){ console.error(e); return jsonError('Could not start race.',500); }
+}
+
+import { getAdminSupabase } from '@/lib/supabase';
+import { cleanRoomCode, jsonError } from '@/lib/api';
+import { publicQuestion, QUESTIONS } from '@/lib/questions';
+
+export async function GET(request) {
+  try {
+    const code = cleanRoomCode(new URL(request.url).searchParams.get('room'));
+    if (!code) return jsonError('Room code required.');
+    const supabase = getAdminSupabase();
+    const { data:room } = await supabase.from('rooms')
+      .select('code,status,current_question,question_started_at,created_at')
+      .eq('code',code).maybeSingle();
+    if (!room) return jsonError('Room not found.',404);
+
+    const { data:players, error } = await supabase.from('players')
+      .select('id,name,yards,finish_place,joined_at')
+      .eq('room_code',code)
+      .order('joined_at',{ascending:true});
+    if (error) throw error;
+
+    const question = room.current_question >= 0 ? publicQuestion(room.current_question) : null;
+    return Response.json({
+      ok:true,
+      room:{...room, total_questions:QUESTIONS.length},
+      players:players || [],
+      question
+    });
+  } catch (e) {
+    console.error(e);
+    return jsonError('Could not load room.',500);
+  }
+}
+
+:root{--bg:#07111f;--panel:#102039;--panel2:#162d4d;--line:#2d4d72;--text:#f7fbff;--muted:#a7bdd4;--cyan:#69e4ff;--gold:#ffd166;--green:#5de29b;--red:#ff8585;--purple:#a092ff}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:#07111f;color:var(--text)}
+body{background:radial-gradient(circle at 15% 10%,rgba(105,228,255,.16),transparent 28%),radial-gradient(circle at 85% 12%,rgba(160,146,255,.15),transparent 28%),linear-gradient(135deg,#06101c,#0b1728 48%,#08111f)}
+button,input{font:inherit}.page{min-height:100vh;padding:18px}.shell{max-width:1400px;margin:0 auto}.top{text-align:center;margin-bottom:18px}.top h1{margin:0;font-size:clamp(28px,4vw,48px)}.top p{margin:6px 0;color:var(--muted)}
+.card{background:linear-gradient(180deg,rgba(18,36,61,.96),rgba(11,24,42,.96));border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 18px 45px rgba(0,0,0,.24)}.grid{display:grid;gap:14px}.cols{grid-template-columns:360px 1fr}.btn{border:1px solid #42678f;background:#18314e;color:white;border-radius:11px;padding:11px 14px;font-weight:850;cursor:pointer;min-height:44px}.btn.primary{background:linear-gradient(90deg,var(--cyan),#b8f4ff);color:#06121c;border:0}.btn.gold{background:linear-gradient(90deg,var(--gold),#ffe9a0);color:#201800;border:0}.btn.danger{border-color:#7c4646;color:#ffd7d7}.btn:disabled{opacity:.45;cursor:not-allowed}.input{width:100%;background:#0b1c30;border:1px solid #35587f;color:white;border-radius:10px;padding:11px 12px;min-height:44px}.label{display:block;color:var(--muted);font-size:12px;margin:0 0 5px}.stack{display:grid;gap:10px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.muted{color:var(--muted)}.bigcode{font-size:clamp(34px,6vw,66px);font-weight:1000;letter-spacing:4px;color:var(--gold);text-align:center}.status{font-size:12px;font-weight:900;letter-spacing:1px;color:var(--gold)}
+.track{display:grid;gap:7px}.lane{position:relative;height:58px;border-radius:10px;background:linear-gradient(90deg,#155b35,#1d7344);border:1px solid rgba(255,255,255,.08);overflow:hidden}.lane:after{content:"";position:absolute;right:14%;top:0;bottom:0;width:7px;background:repeating-linear-gradient(0deg,#fff 0 8px,#111 8px 16px)}.horse{position:absolute;left:2%;top:8px;display:flex;align-items:center;gap:8px;transition:left .55s cubic-bezier(.2,.8,.2,1)}.horseIcon{display:inline-block;transform:scaleX(-1);font-size:30px}.horseName{background:rgba(5,15,27,.82);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:5px 8px;font-size:12px;font-weight:900;white-space:nowrap}.finish{border-color:rgba(255,209,102,.7);box-shadow:0 0 18px rgba(255,209,102,.14)}
+.question{font-size:clamp(22px,3vw,34px);font-weight:950;line-height:1.15;margin:8px 0 14px}.answers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.answer{min-height:72px;text-align:left;padding:12px 14px}.answer.correct{border-color:var(--green);background:#183c31}.answer.wrong{border-color:var(--red);background:#42242a}.timer{font-size:36px;font-weight:1000;color:var(--gold)}
+.players{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.player{border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:9px;background:rgba(255,255,255,.025)}.pick{display:inline-flex;min-width:32px;height:32px;align-items:center;justify-content:center;border-radius:8px;background:rgba(160,146,255,.16);font-weight:1000;margin-right:7px}.hero{max-width:620px;margin:8vh auto 0}.center{text-align:center}.success{color:#a7ffd0}.error{color:#ffb3b3}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:rgba(255,209,102,.12);color:#ffe9a0;font-size:11px;font-weight:900}.spacer{height:8px}
+@media(max-width:900px){.cols{grid-template-columns:1fr}.answers,.players{grid-template-columns:1fr}.page{padding:12px}.horseName{max-width:150px;overflow:hidden;text-overflow:ellipsis}}
+
+'use client';
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+const POLL=900;
+export default function HostPage(){
+  const [roomCode,setRoomCode]=useState('PRIMOS26');
+  const [hostKey,setHostKey]=useState('');
+  const [state,setState]=useState(null);
+  const [error,setError]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [seconds,setSeconds]=useState(20);
+  const lastAuto=useRef(-1);
+
+  useEffect(()=>{const saved=localStorage.getItem('primos_host');if(saved){try{const x=JSON.parse(saved);setRoomCode(x.roomCode||'PRIMOS26');setHostKey(x.hostKey||'');}catch{}}},[]);
+
+  async function fetchState(){
+    if(!roomCode)return;
+    try{const r=await fetch(`/api/room/state?room=${encodeURIComponent(roomCode)}`,{cache:'no-store'});const d=await r.json();if(d.ok)setState(d);}catch{}
+  }
+  useEffect(()=>{if(!hostKey)return;fetchState();const id=setInterval(fetchState,POLL);return()=>clearInterval(id);},[hostKey,roomCode]);
+
+  useEffect(()=>{
+    if(state?.room?.status!=='running'||!state.room.question_started_at){setSeconds(20);return;}
+    const tick=()=>{const elapsed=Math.floor((Date.now()-new Date(state.room.question_started_at).getTime())/1000);setSeconds(Math.max(0,20-elapsed));};tick();const id=setInterval(tick,250);return()=>clearInterval(id);
+  },[state?.room?.question_started_at,state?.room?.status]);
+
+  useEffect(()=>{
+    const q=state?.room?.current_question;
+    if(state?.room?.status==='running'&&seconds===0&&Number.isInteger(q)&&lastAuto.current!==q){lastAuto.current=q;nextQuestion();}
+  },[seconds,state?.room?.status,state?.room?.current_question]);
+
+  async function createRoom(){
+    setBusy(true);setError('');
+    const r=await fetch('/api/room/create',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode})});const d=await r.json();setBusy(false);
+    if(!d.ok){setError(d.error||'Could not create room.');return;}setRoomCode(d.roomCode);setHostKey(d.hostKey);localStorage.setItem('primos_host',JSON.stringify(d));await fetchState();
+  }
+  async function hostAction(path){
+    setBusy(true);setError('');const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,hostKey})});const d=await r.json();setBusy(false);if(!d.ok){setError(d.error||'Action failed.');return d;}await fetchState();return d;
+  }
+  const start=()=>hostAction('/api/room/start');
+  const nextQuestion=()=>hostAction('/api/room/next');
+  const reset=async()=>{if(confirm('Reset all yards, answers, and draft positions?'))await hostAction('/api/room/reset');};
+
+  const invite=typeof window!=='undefined'?`${location.origin}/?room=${roomCode}`:'';
+  const sorted=useMemo(()=>[...(state?.players||[])].sort((a,b)=>(a.finish_place||99)-(b.finish_place||99)||b.yards-a.yards),[state]);
+
+  if(!hostKey){
+    return <main className="page"><div className="hero card"><div className="top"><h1>📺 Primos Trivia Derby Host</h1><p>Create the room you’ll show on the TV.</p></div><div className="stack"><label><span className="label">Room code</span><input className="input" value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,''))} maxLength={10}/></label>{error&&<div className="error">{error}</div>}<button className="btn primary" disabled={busy} onClick={createRoom}>{busy?'Creating…':'Create Room'}</button><a className="btn center" href="/" style={{textDecoration:'none'}}>Player Screen</a></div></div></main>;
+  }
+
+  return <main className="page"><div className="shell"><div className="top"><h1>🏇 2026 Primos Trivia Derby</h1><p>Room <strong>{roomCode}</strong></p></div>
+    <div className="grid cols">
+      <aside className="card stack"><div className="status">ROOM CODE</div><div className="bigcode">{roomCode}</div><div className="muted center">Managers open:</div><div className="center" style={{wordBreak:'break-all'}}>{invite}</div><button className="btn" onClick={()=>navigator.clipboard?.writeText(invite)}>Copy Invite Link</button><button className="btn" onClick={()=>document.documentElement.requestFullscreen?.()}>⛶ Full Screen</button><div className="players">{(state?.players||[]).map(p=><div className="player" key={p.id}>{p.finish_place&&<span className="pick">#{p.finish_place}</span>}<strong>{p.name}</strong><div className="muted">{p.yards} yd</div></div>)}</div><div className="row"><button className="btn primary" disabled={busy||state?.room?.status!=='lobby'||state?.players?.length!==10} onClick={start}>Start Race</button><button className="btn" disabled={busy||state?.room?.status!=='running'} onClick={nextQuestion}>Next</button><button className="btn danger" disabled={busy} onClick={reset}>Reset</button></div>{error&&<div className="error">{error}</div>}</aside>
+      <section className="stack">
+        <div className="card"><div className="track">{(state?.players||[]).map(p=><div key={p.id} className={`lane${p.finish_place?' finish':''}`}><div className="horse" style={{left:`${Math.min(90,2+p.yards*.88)}%`}}><span className="horseIcon">🐎</span><span className="horseName">{p.name}{p.finish_place?` • Pick #${p.finish_place}`:''}</span></div></div>)}</div></div>
+        <div className="card">
+          {state?.room?.status==='lobby'&&<><div className="status">LOBBY</div><div className="question">{state.players.length}/10 managers joined</div><p className="muted">Share the link or room code, then start when everybody is ready.</p></>}
+          {state?.room?.status==='running'&&state.question&&<><div className="row"><span className="pill">{state.question.category}</span><span className="muted">Question {state.question.index+1} of {state.room.total_questions}</span><span style={{marginLeft:'auto'}} className="timer">{seconds}</span></div><div className="question">{state.question.question}</div><div className="answers">{state.question.options.map((o,i)=><div key={i} className="btn answer" style={{cursor:'default'}}>{String.fromCharCode(65+i)}. {o}</div>)}</div><p className="muted">The host auto-advances at 0 seconds, or you can press Next manually.</p></>}
+          {state?.room?.status==='finished'&&<><div className="status">FINAL DRAFT ORDER</div><div className="question">Race complete</div><div className="players">{sorted.filter(p=>p.finish_place).map(p=><div className="player" key={p.id}><span className="pick">#{p.finish_place}</span><strong>{p.name}</strong></div>)}</div></>}
+        </div>
+      </section>
+    </div>
+  </div></main>;
+}
+
+import './globals.css';
+
+export const metadata = {
+  title: '2026 Primos Trivia Derby',
+  description: 'Multiplayer trivia horse race for the 2026 Primos Fantasy League draft order.'
+};
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
+}
+
+'use client';
+import { useEffect, useMemo, useState } from 'react';
+
+const POLL=1000;
+export default function PlayerPage(){
+  const [roomCode,setRoomCode]=useState('');
+  const [name,setName]=useState('');
+  const [player,setPlayer]=useState(null);
+  const [state,setState]=useState(null);
+  const [error,setError]=useState('');
+  const [answerResult,setAnswerResult]=useState(null);
+  const [answeredQuestion,setAnsweredQuestion]=useState(null);
+  const [seconds,setSeconds]=useState(20);
+
+  useEffect(()=>{
+    const p=new URLSearchParams(location.search);
+    const code=(p.get('room')||'').toUpperCase();
+    if(code){
+      setRoomCode(code);
+      try{
+        const saved=JSON.parse(localStorage.getItem(`primos_player_${code}`)||'null');
+        if(saved?.id&&saved?.token){setPlayer(saved);setName(saved.name||'Manager');}
+      }catch{}
+    }
+  },[]);
+
+  async function fetchState(){
+    if(!roomCode)return;
+    try{const r=await fetch(`/api/room/state?room=${encodeURIComponent(roomCode)}`,{cache:'no-store'});const d=await r.json();if(d.ok)setState(d);}catch{}
+  }
+  useEffect(()=>{if(!player)return;fetchState();const id=setInterval(fetchState,POLL);return()=>clearInterval(id);},[player,roomCode]);
+  useEffect(()=>{if(state?.room?.current_question!==answeredQuestion){setAnswerResult(null);}},[state?.room?.current_question,answeredQuestion]);
+
+
+  useEffect(()=>{
+    if(state?.room?.status!=='running'||!state.room.question_started_at){setSeconds(20);return;}
+    const tick=()=>{const elapsed=Math.floor((Date.now()-new Date(state.room.question_started_at).getTime())/1000);setSeconds(Math.max(0,20-elapsed));};
+    tick();const id=setInterval(tick,250);return()=>clearInterval(id);
+  },[state?.room?.question_started_at,state?.room?.status]);
+
+  async function join(e){
+    e.preventDefault();setError('');
+    const r=await fetch('/api/room/join',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,name})});
+    const d=await r.json();if(!d.ok){setError(d.error||'Could not join.');return;}setPlayer(d.player);setName(d.player.name);localStorage.setItem(`primos_player_${roomCode}`,JSON.stringify(d.player));await fetchState();
+  }
+
+  async function answer(index){
+    if(!state?.question || answerResult)return;
+    const q=state.question.index;setAnsweredQuestion(q);
+    const r=await fetch('/api/answer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({roomCode,playerId:player.id,playerToken:player.token,questionIndex:q,answerIndex:index})});
+    const d=await r.json();if(!d.ok){setError(d.error||'Could not submit answer.');return;}setAnswerResult({...d,chosen:index});await fetchState();
+  }
+
+  const me=useMemo(()=>state?.players?.find(p=>p.id===player?.id),[state,player]);
+
+  if(!player){
+    return <main className="page"><div className="hero card"><div className="top"><h1>🏇 Primos Trivia Derby</h1><p>Join the room, answer trivia, move your horse.</p></div><form className="stack" onSubmit={join}><label><span className="label">Room code</span><input className="input" value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase())} maxLength={10} placeholder="PRIMOS26" /></label><label><span className="label">Manager name</span><input className="input" value={name} onChange={e=>setName(e.target.value)} maxLength={24} placeholder="Your name" /></label>{error&&<div className="error">{error}</div>}<button className="btn primary" type="submit">Join Race</button><a className="btn center" href="/host" style={{textDecoration:'none'}}>Host / TV Screen</a></form></div></main>;
+  }
+
+  return <main className="page"><div className="shell"><div className="top"><h1>🏇 {name}</h1><p>Room <strong>{roomCode}</strong></p></div>
+    <div className="grid cols">
+      <section className="card"><div className="status">YOUR HORSE</div><div className="question">{me?.finish_place ? `Finished — Draft Pick #${me.finish_place}` : `${me?.yards||0} yards`}</div><div className="lane"><div className="horse" style={{left:`${Math.min(90,2+(me?.yards||0)*.88)}%`}}><span className="horseIcon">🐎</span></div></div><div className="spacer"/><div className="muted">Correct answer: +10 yards. Fastest correct answers can earn +3, +2, or +1 bonus yards.</div></section>
+      <section className="card">
+        {state?.room?.status==='lobby' && <><div className="status">WAITING FOR HOST</div><div className="question">You’re in the race.</div><p className="muted">Keep this page open. The first question will appear automatically.</p></>}
+        {state?.room?.status==='running' && state.question && <><div className="row"><span className="pill">{state.question.category}</span><span className="muted">Question {state.question.index+1}</span><span style={{marginLeft:'auto'}} className="timer">{seconds}</span></div><div className="question">{state.question.question}</div><div className="answers">{state.question.options.map((opt,i)=>{const cls=answerResult?.chosen===i ? (answerResult.correct?' correct':' wrong'):'';return <button key={i} className={`btn answer${cls}`} disabled={!!answerResult || !!me?.finish_place} onClick={()=>answer(i)}>{String.fromCharCode(65+i)}. {opt}</button>})}</div>{answerResult&&<div className="status" style={{marginTop:12}}>{answerResult.correct ? `CORRECT! +${answerResult.awardedYards} yards${answerResult.speedBonus?` (${answerResult.speedBonus} speed bonus)`:''}` : 'WRONG — no yards this question'}</div>}</>}
+        {state?.room?.status==='finished' && <><div className="status">RACE COMPLETE</div><div className="question">Draft Pick #{me?.finish_place||'—'}</div><p className="muted">The host has the final 1–10 draft order.</p></>}
+        {error&&<div className="error" style={{marginTop:10}}>{error}</div>}
+      </section>
+    </div>
+  </div></main>;
+}
+
+export function cleanRoomCode(value='') {
+  return String(value).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,10);
+}
+
+export function cleanName(value='') {
+  return String(value).replace(/[<>]/g,'').trim().slice(0,24);
+}
+
+export function jsonError(message, status=400) {
+  return Response.json({ ok:false, error:message }, { status });
+}
+
+import { getAdminSupabase } from './supabase';
+import { cleanRoomCode } from './api';
+
+export async function requireHost(roomCode, hostKey) {
+  const code = cleanRoomCode(roomCode);
+  if (!code || !hostKey) return { ok:false, status:401, error:'Missing host credentials.' };
+  const supabase = getAdminSupabase();
+  const { data:room } = await supabase.from('rooms').select('*').eq('code',code).eq('host_key',hostKey).maybeSingle();
+  if (!room) return { ok:false, status:403, error:'Invalid host credentials.' };
+  return { ok:true, room, supabase, code };
+}
+
+export const QUESTIONS = [
+  { category:'NFL', question:'How many points is a touchdown worth before the extra point?', options:['3','6','7','8'], answer:1 },
+  { category:'NFL', question:'How many yards are in a standard NFL field from goal line to goal line?', options:['80','90','100','120'], answer:2 },
+  { category:'NFL', question:'How many players from one team are on the field at a time?', options:['9','10','11','12'], answer:2 },
+  { category:'NFL', question:'What is the trophy awarded to the Super Bowl champion called?', options:['Heisman Trophy','Lombardi Trophy','Halás Trophy','Rozelle Trophy'], answer:1 },
+  { category:'NFL', question:'A safety is worth how many points?', options:['1','2','3','6'], answer:1 },
+  { category:'NFL', question:'Which position usually snaps the football to begin an offensive play?', options:['Center','Guard','Tight end','Fullback'], answer:0 },
+  { category:'NFL', question:'How many downs does an offense normally get to gain 10 yards?', options:['3','4','5','6'], answer:1 },
+  { category:'NFL', question:'The NFL regular-season overtime coin toss determines what first?', options:['Which coach challenges first','Initial possession choice','Field goal distance','Number of timeouts'], answer:1 },
+  { category:'Sports', question:'How many players are on the court for one basketball team at a time?', options:['4','5','6','7'], answer:1 },
+  { category:'Sports', question:'How many strikes make an out in baseball?', options:['2','3','4','5'], answer:1 },
+  { category:'Sports', question:'In golf, one stroke under par on a hole is called what?', options:['Birdie','Eagle','Bogey','Albatross'], answer:0 },
+  { category:'Sports', question:'How many points is a free throw worth in basketball?', options:['1','2','3','4'], answer:0 },
+  { category:'Sports', question:'What color jersey is worn by the Tour de France overall leader?', options:['Green','Yellow','Red','White'], answer:1 },
+  { category:'Movies', question:'Which movie franchise features the character Darth Vader?', options:['Star Trek','Star Wars','The Matrix','Dune'], answer:1 },
+  { category:'Movies', question:'In The Lion King, what is Simba’s father’s name?', options:['Scar','Mufasa','Rafiki','Zazu'], answer:1 },
+  { category:'Movies', question:'Which film features the line concept of choosing a red pill or a blue pill?', options:['Inception','The Matrix','Blade Runner','Minority Report'], answer:1 },
+  { category:'Music', question:'How many strings does a standard guitar usually have?', options:['4','5','6','8'], answer:2 },
+  { category:'Music', question:'Which instrument typically has 88 keys?', options:['Piano','Violin','Trumpet','Saxophone'], answer:0 },
+  { category:'General', question:'What is the largest planet in our solar system?', options:['Earth','Saturn','Jupiter','Neptune'], answer:2 },
+  { category:'General', question:'What is the chemical symbol for gold?', options:['Ag','Au','Gd','Go'], answer:1 },
+  { category:'General', question:'Which ocean is the largest?', options:['Atlantic','Indian','Arctic','Pacific'], answer:3 },
+  { category:'General', question:'How many sides does a hexagon have?', options:['5','6','7','8'], answer:1 },
+  { category:'General', question:'Which planet is known as the Red Planet?', options:['Mars','Venus','Mercury','Jupiter'], answer:0 },
+  { category:'General', question:'What is the capital of Japan?', options:['Kyoto','Osaka','Tokyo','Nagoya'], answer:2 },
+  { category:'General', question:'How many minutes are in two hours?', options:['100','110','120','140'], answer:2 },
+  { category:'General', question:'What is H2O commonly called?', options:['Salt','Water','Oxygen','Hydrogen'], answer:1 },
+  { category:'General', question:'Which continent is Egypt primarily located on?', options:['Asia','Africa','Europe','South America'], answer:1 },
+  { category:'General', question:'How many days are in a leap year?', options:['364','365','366','367'], answer:2 },
+  { category:'General', question:'What is the square root of 144?', options:['10','11','12','14'], answer:2 },
+  { category:'General', question:'Which animal is the largest living land animal?', options:['Giraffe','Hippopotamus','African elephant','Rhinoceros'], answer:2 }
+];
+
+export function publicQuestion(index) {
+  const q = QUESTIONS[index];
+  if (!q) return null;
+  return { index, category: q.category, question: q.question, options: q.options };
+}
+
+import { createClient } from '@supabase/supabase-js';
+
+export function getAdminSupabase() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+-- Run this entire file once in Supabase -> SQL Editor.
+
+create extension if not exists pgcrypto;
+
+create table if not exists public.rooms (
+  code text primary key,
+  host_key text not null,
+  status text not null default 'lobby' check (status in ('lobby','running','finished')),
+  current_question integer not null default -1,
+  question_started_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.players (
+  id uuid primary key default gen_random_uuid(),
+  room_code text not null references public.rooms(code) on delete cascade,
+  name text not null,
+  player_token text not null,
+  yards integer not null default 0 check (yards between 0 and 100),
+  finish_place integer,
+  joined_at timestamptz not null default now()
+);
+
+create unique index if not exists players_room_name_unique
+on public.players (room_code, lower(name));
+
+create table if not exists public.answers (
+  id bigserial primary key,
+  room_code text not null references public.rooms(code) on delete cascade,
+  player_id uuid not null references public.players(id) on delete cascade,
+  question_index integer not null,
+  answer_index integer not null,
+  correct boolean not null,
+  awarded_yards integer not null default 0,
+  answered_at timestamptz not null default now(),
+  unique(room_code, player_id, question_index)
+);
+
+-- Server-side function: records an answer, awards 10 yards for correct answers,
+-- plus a +3/+2/+1 speed bonus to the first three correct answers on each question.
+create or replace function public.apply_answer(
+  p_room_code text,
+  p_player_id uuid,
+  p_question_index integer,
+  p_answer_index integer,
+  p_correct boolean
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  prior_correct integer := 0;
+  bonus integer := 0;
+  awarded integer := 0;
+  old_yards integer := 0;
+  new_yards integer := 0;
+  place integer := null;
+begin
+  -- Serialize answer processing within a room so speed bonuses and finish places stay deterministic.
+  perform 1 from rooms where code=p_room_code for update;
+
+  if exists (
+    select 1 from answers
+    where room_code=p_room_code and player_id=p_player_id and question_index=p_question_index
+  ) then
+    raise exception 'duplicate answer';
+  end if;
+
+  select yards into old_yards
+  from players
+  where id=p_player_id and room_code=p_room_code
+  for update;
+
+  if old_yards is null then
+    raise exception 'player not found';
+  end if;
+
+  if p_correct then
+    select count(*) into prior_correct
+    from answers
+    where room_code=p_room_code and question_index=p_question_index and correct=true;
+    bonus := greatest(0, 3 - prior_correct);
+    awarded := 10 + bonus;
+  end if;
+
+  insert into answers(room_code,player_id,question_index,answer_index,correct,awarded_yards)
+  values(p_room_code,p_player_id,p_question_index,p_answer_index,p_correct,awarded);
+
+  new_yards := least(100, old_yards + awarded);
+  update players set yards=new_yards where id=p_player_id;
+
+  if new_yards >= 100 then
+    select finish_place into place from players where id=p_player_id;
+    if place is null then
+      select coalesce(max(finish_place),0)+1 into place
+      from players where room_code=p_room_code;
+      update players set finish_place=place where id=p_player_id;
+    end if;
+  end if;
+
+  return jsonb_build_object(
+    'awardedYards',awarded,
+    'speedBonus',bonus,
+    'yards',new_yards,
+    'finishPlace',place
+  );
+end;
+$$;
+
+-- Only the Vercel server uses the service role key. Browser users never receive it.
+alter table public.rooms enable row level security;
+alter table public.players enable row level security;
+alter table public.answers enable row level security;
+
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
+
+node_modules
+.next
+.vercel
+.env*
+!.env.example
+.DS_Store
+
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"]
+    }
+  }
+}
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  poweredByHeader: false,
+};
+
+export default nextConfig;
+
+{
+  "name": "primos-trivia-derby",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.115.0",
+    "next": "16.3.4",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  }
+}
+
+# 2026 Primos Trivia Derby
+
+A multiplayer trivia horse race for setting the 2026 Primos Fantasy League draft order.
+
+## What it does
+
+- Exactly 10 managers join from their phones before the host starts the race.
+- The host opens `/host` on a laptop/TV.
+- Everyone sees the same trivia question.
+- Correct answer = **10 yards**.
+- First three correct answers on a question receive a **+3 / +2 / +1 yard speed bonus**.
+- First horse to 100 yards receives **Draft Pick #1**.
+- The race continues until every manager receives a draft position. If the 30-question bank ends before every horse reaches 100, the remaining positions are ranked by total yards; exact yardage ties are broken randomly.
+- Host screen automatically advances every 20 seconds, or the host can press **Next**.
+
+## Before deploying: create the Supabase database
+
+Vercel hosts the website. Supabase stores the shared multiplayer room so all phones and the TV stay synchronized.
+
+1. Create a free account/project at Supabase.
+2. Open **SQL Editor** in the Supabase dashboard.
+3. Open the file `supabase/schema.sql` from this project.
+4. Copy the entire SQL file into Supabase SQL Editor and run it once.
+5. In Supabase, open **Project Settings -> API**.
+6. Copy:
+   - Project URL
+   - `service_role` key (keep this secret)
+
+## Upload this project to GitHub
+
+1. Unzip this package on your computer.
+2. Open your GitHub repository `primos-trivia-derby`.
+3. Choose **Add file -> Upload files**.
+4. Drag **everything inside this folder** into GitHub.
+5. Commit the files.
+
+Do not upload only the ZIP. Upload the files and folders inside it.
+
+## Deploy with Vercel
+
+1. In Vercel choose **Add New -> Project**.
+2. Import your `primos-trivia-derby` GitHub repository.
+3. Before deploying, open **Environment Variables** and add:
+
+   `SUPABASE_URL` = your Supabase Project URL
+
+   `SUPABASE_SERVICE_ROLE_KEY` = your Supabase service_role key
+
+4. Deploy.
+5. Vercel will give you a public URL, such as:
+
+   `https://primos-trivia-derby.vercel.app`
+
+## Draft night
+
+### TV / Host
+Open:
+
+`https://YOUR-SITE.vercel.app/host`
+
+Create a room such as `PRIMOS26`.
+
+### Managers
+Send everyone the invite link displayed on the host screen, or have them open:
+
+`https://YOUR-SITE.vercel.app`
+
+They enter the room code and their manager name.
+
+## Change trivia questions
+
+Edit `lib/questions.js`.
+
+Each question looks like:
+
+```js
+{
+  category: 'NFL',
+  question: 'Question text?',
+  options: ['A','B','C','D'],
+  answer: 2
+}
+```
+
+`answer` is zero-based: `0` = first choice, `1` = second choice, etc.
+
+## Security note
+
+The Supabase `service_role` key is used only by Vercel server routes. It is never sent to player browsers. Each player also receives a private random session token so another manager cannot submit answers as them just by seeing the public race state. Never commit your real key into GitHub; keep it in Vercel Environment Variables.
+
+PRIMOS TRIVIA DERBY - FAST SETUP CHECKLIST
+
+[ ] 1. Unzip this folder.
+[ ] 2. Create a free Supabase project.
+[ ] 3. Run supabase/schema.sql in Supabase SQL Editor.
+[ ] 4. Copy Supabase Project URL.
+[ ] 5. Copy Supabase service_role key.
+[ ] 6. Upload ALL project files/folders to your GitHub repo.
+[ ] 7. Import the GitHub repo into Vercel.
+[ ] 8. Add SUPABASE_URL in Vercel Environment Variables.
+[ ] 9. Add SUPABASE_SERVICE_ROLE_KEY in Vercel Environment Variables.
+[ ] 10. Deploy.
+[ ] 11. Open /host on the TV/laptop.
+[ ] 12. Send the normal site link to the managers.
